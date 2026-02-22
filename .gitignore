@@ -7,7 +7,6 @@
 
 # npm / bun
 node_modules
-bun.lock
 package-lock.json
 
 # Don't include the compiled main.js file in the repo.
@@ -28,9 +27,6 @@ server/node_modules
 server/dist
 server/.env
 server/.partykit
-server/bun.lock
 server/package-lock.json
 
-# Test scripts (temporary)
-test-*.ts
 
