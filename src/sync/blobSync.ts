@@ -18,6 +18,11 @@ import type { VaultSync } from "./vaultSync";
 import type { BlobRef } from "../types";
 import { ORIGIN_SEED } from "../types";
 import {
+	appendTraceParams,
+	type TraceHttpContext,
+	type TraceRecord,
+} from "../debug/trace";
+import {
 	type BlobHashCache,
 	getCachedHash,
 	setCachedHash,
@@ -56,6 +61,7 @@ class BlobPresignClient {
 		private host: string,
 		private token: string,
 		private roomId: string,
+		private trace?: TraceHttpContext,
 	) {}
 
 	/**
@@ -63,7 +69,12 @@ class BlobPresignClient {
 	 * PartyKit exposes rooms at: /parties/main/<roomId>
 	 */
 	private url(endpoint: string): string {
-		return `${this.host}/parties/main/${encodeURIComponent(this.roomId)}${endpoint}?token=${encodeURIComponent(this.token)}`;
+		// Do not URL-encode roomId here: websocket sync uses raw room IDs,
+		// and encoding would route HTTP requests to a different DO room.
+		return appendTraceParams(
+			`${this.host}/parties/main/${this.roomId}${endpoint}?token=${encodeURIComponent(this.token)}`,
+			this.trace,
+		);
 	}
 
 	async presignPut(
@@ -228,14 +239,17 @@ export class BlobSyncManager {
 			maxAttachmentSizeKB: number;
 			attachmentConcurrency: number;
 			debug: boolean;
+			trace?: TraceHttpContext;
 		},
 		hashCache: BlobHashCache,
+		private trace?: TraceRecord,
 	) {
 		const roomId = "v1:" + settings.vaultId;
 		this.presignClient = new BlobPresignClient(
 			settings.host,
 			settings.token,
 			roomId,
+			settings.trace,
 		);
 		this.maxConcurrency = settings.attachmentConcurrency;
 		this.maxSize = settings.maxAttachmentSizeKB * 1024;
@@ -888,7 +902,24 @@ export class BlobSyncManager {
 		this.log("BlobSyncManager destroyed");
 	}
 
+	getDebugSnapshot(): {
+		pendingUploads: number;
+		pendingDownloads: number;
+		suppressedCount: number;
+		uploadQueue: string[];
+		downloadQueue: string[];
+	} {
+		return {
+			pendingUploads: this.uploadQueue.size,
+			pendingDownloads: this.downloadQueue.size,
+			suppressedCount: this.suppressedPaths.size,
+			uploadQueue: Array.from(this.uploadQueue.values()).map((item) => item.path),
+			downloadQueue: Array.from(this.downloadQueue.values()).map((item) => item.path),
+		};
+	}
+
 	private log(msg: string): void {
+		this.trace?.("blob", msg);
 		if (this.debug) {
 			console.log(`[vault-crdt-sync:blob] ${msg}`);
 		}

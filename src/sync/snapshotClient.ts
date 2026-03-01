@@ -13,6 +13,7 @@ import * as Y from "yjs";
 import { gunzipSync } from "fflate";
 import type { VaultSyncSettings } from "../settings";
 import type { FileMeta, BlobRef } from "../types";
+import { appendTraceParams, type TraceHttpContext } from "../debug/trace";
 
 // -------------------------------------------------------------------
 // Types (mirrors server SnapshotIndex)
@@ -72,15 +73,22 @@ function baseUrl(settings: VaultSyncSettings): string {
 	const host = settings.host.replace(/\/$/, "");
 	const roomId = `v1:${settings.vaultId}`;
 	// PartyKit HTTP endpoint format: host/parties/main/<roomId>
-	return `${host}/parties/main/${encodeURIComponent(roomId)}`;
+	// IMPORTANT: do not URL-encode roomId here. The websocket provider uses
+	// the raw room id (v1:<vaultId>), and encoding would route HTTP endpoints
+	// to a different DO room (v1%3A...) than the live Yjs websocket room.
+	return `${host}/parties/main/${roomId}`;
 }
 
 async function serverPost(
 	settings: VaultSyncSettings,
 	endpoint: string,
 	body?: Record<string, unknown>,
+	trace?: TraceHttpContext,
 ): Promise<unknown> {
-	const url = `${baseUrl(settings)}/${endpoint}?token=${encodeURIComponent(settings.token)}`;
+	const url = appendTraceParams(
+		`${baseUrl(settings)}/${endpoint}?token=${encodeURIComponent(settings.token)}`,
+		trace,
+	);
 	const res = await fetch(url, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -96,8 +104,12 @@ async function serverPost(
 async function serverGet(
 	settings: VaultSyncSettings,
 	endpoint: string,
+	trace?: TraceHttpContext,
 ): Promise<unknown> {
-	const url = `${baseUrl(settings)}/${endpoint}?token=${encodeURIComponent(settings.token)}`;
+	const url = appendTraceParams(
+		`${baseUrl(settings)}/${endpoint}?token=${encodeURIComponent(settings.token)}`,
+		trace,
+	);
 	const res = await fetch(url, { method: "GET" });
 	if (!res.ok) {
 		const text = await res.text();
@@ -116,8 +128,9 @@ async function serverGet(
 export async function requestDailySnapshot(
 	settings: VaultSyncSettings,
 	device?: string,
+	trace?: TraceHttpContext,
 ): Promise<SnapshotResult> {
-	return await serverPost(settings, "snapshot/maybe", { device }) as SnapshotResult;
+	return await serverPost(settings, "snapshot/maybe", { device }, trace) as SnapshotResult;
 }
 
 /**
@@ -126,8 +139,9 @@ export async function requestDailySnapshot(
 export async function requestSnapshotNow(
 	settings: VaultSyncSettings,
 	device?: string,
+	trace?: TraceHttpContext,
 ): Promise<SnapshotResult> {
-	return await serverPost(settings, "snapshot/now", { device }) as SnapshotResult;
+	return await serverPost(settings, "snapshot/now", { device }, trace) as SnapshotResult;
 }
 
 // -------------------------------------------------------------------
@@ -139,8 +153,9 @@ export async function requestSnapshotNow(
  */
 export async function listSnapshots(
 	settings: VaultSyncSettings,
+	trace?: TraceHttpContext,
 ): Promise<SnapshotIndex[]> {
-	const result = await serverGet(settings, "snapshot/list") as { snapshots: SnapshotIndex[] };
+	const result = await serverGet(settings, "snapshot/list", trace) as { snapshots: SnapshotIndex[] };
 	return result.snapshots ?? [];
 }
 
@@ -155,12 +170,13 @@ export async function listSnapshots(
 export async function downloadSnapshot(
 	settings: VaultSyncSettings,
 	snapshot: SnapshotIndex,
+	trace?: TraceHttpContext,
 ): Promise<Y.Doc> {
 	// Get presigned URL for the crdt.bin.gz
 	const presignResult = await serverPost(settings, "snapshot/presign-get", {
 		snapshotId: snapshot.snapshotId,
 		day: snapshot.day,
-	}) as { url: string; expiresIn: number };
+	}, trace) as { url: string; expiresIn: number };
 
 	// Download the gzipped CRDT data
 	const res = await fetch(presignResult.url);
