@@ -6,6 +6,7 @@
  */
 import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
+import WebSocket from "ws";
 
 const HOST = process.env.YAOS_TEST_HOST || "http://127.0.0.1:8787";
 const TOKEN = process.env.SYNC_TOKEN || "dev-sync-token";
@@ -28,6 +29,7 @@ let finished = false;
 const provider = new YSyncProvider(HOST, ROOM_ID, ydoc, {
 	prefix: syncPrefix,
 	params: { token: TOKEN },
+	WebSocketPolyfill: globalThis.WebSocket ?? WebSocket,
 	connect: true,
 });
 
