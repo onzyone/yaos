@@ -1,9 +1,9 @@
 {
-	"id": "vault-crdt-sync",
-	"name": "Vault CRDT sync",
-	"version": "0.1.5",
+	"id": "yaos",
+	"name": "YAOS",
+	"version": "0.2.0",
 	"minAppVersion": "1.5.0",
-	"description": "Real-time collaborative vault sync across devices using Yjs CRDTs and PartyKit.",
+	"description": "Real-time collaborative vault sync across devices using Yjs CRDTs and Cloudflare Workers.",
 	"author": "Kavin",
 	"authorUrl": "https://github.com/kavinsood",
 	"isDesktopOnly": false
