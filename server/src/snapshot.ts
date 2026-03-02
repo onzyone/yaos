@@ -19,6 +19,8 @@ import * as Y from "yjs";
 import { gzipSync } from "fflate";
 import type { R2Config } from "./presign";
 import { AwsClient } from "aws4fetch";
+import { XMLParser } from "fast-xml-parser";
+import { mapWithConcurrency } from "./concurrency";
 
 // -------------------------------------------------------------------
 // Types
@@ -61,13 +63,21 @@ export interface SnapshotResult {
 // Helpers
 // -------------------------------------------------------------------
 
+const SNAPSHOT_FETCH_CONCURRENCY = 4;
+const r2ListParser = new XMLParser({
+	ignoreAttributes: false,
+	trimValues: false,
+});
+
 function today(): string {
 	return new Date().toISOString().slice(0, 10);
 }
 
 function generateSnapshotId(): string {
 	const ts = Date.now().toString(36);
-	const rand = Math.random().toString(36).slice(2, 8);
+	const bytes = new Uint8Array(4);
+	crypto.getRandomValues(bytes);
+	const rand = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 	return `${ts}-${rand}`;
 }
 
@@ -147,14 +157,21 @@ async function r2List(
 	}
 
 	const xml = await res.text();
-	// Simple XML key extraction — R2 returns S3-compatible ListObjectsV2
-	const keys: string[] = [];
-	const keyRegex = /<Key>([^<]+)<\/Key>/g;
-	let match;
-	while ((match = keyRegex.exec(xml)) !== null) {
-		keys.push(match[1]);
-	}
-	return keys;
+	const parsed = r2ListParser.parse(xml) as {
+		ListBucketResult?: {
+			Contents?: { Key?: string } | Array<{ Key?: string }>;
+		};
+	};
+	const contents = parsed.ListBucketResult?.Contents;
+	const entries = Array.isArray(contents)
+		? contents
+		: contents
+		? [contents]
+		: [];
+
+	return entries
+		.map((entry) => entry.Key)
+		.filter((key): key is string => typeof key === "string");
 }
 
 /**
@@ -266,9 +283,10 @@ export async function listSnapshots(
 	// Filter for index.json files only
 	const indexKeys = keys.filter((k) => k.endsWith("/index.json"));
 
-	// Fetch all indexes in parallel (bounded — typically < 30)
-	const indexes = await Promise.all(
-		indexKeys.map(async (key) => {
+	const indexes = await mapWithConcurrency(
+		indexKeys,
+		SNAPSHOT_FETCH_CONCURRENCY,
+		async (key) => {
 			try {
 				const data = await r2Get(r2, key);
 				const text = new TextDecoder().decode(data);
@@ -276,7 +294,7 @@ export async function listSnapshots(
 			} catch {
 				return null;
 			}
-		}),
+		},
 	);
 
 	// Filter nulls and sort newest first

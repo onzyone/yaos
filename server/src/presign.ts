@@ -6,6 +6,7 @@
  * use for direct PUT/GET to R2.
  */
 import { AwsClient } from "aws4fetch";
+import { mapWithConcurrency } from "./concurrency";
 
 export interface R2Config {
 	accountId: string;
@@ -16,6 +17,7 @@ export interface R2Config {
 
 /** How long presigned URLs remain valid. */
 const PRESIGN_EXPIRY_SECONDS = 900; // 15 minutes
+const R2_HEAD_CONCURRENCY = 4;
 
 /**
  * Build an AwsClient for R2's S3-compatible API.
@@ -130,11 +132,8 @@ export async function checkExists(
 	hashes: string[],
 ): Promise<string[]> {
 	const client = makeClient(config);
-	const present: string[] = [];
-
-	// Fan out HEAD requests in parallel (bounded by input size)
-	const checks = hashes.map(async (hash) => {
-		if (!isValidHash(hash)) return;
+	const present = await mapWithConcurrency(hashes, R2_HEAD_CONCURRENCY, async (hash) => {
+		if (!isValidHash(hash)) return null;
 
 		const key = blobKey(vaultId, hash);
 		const objectUrl = `${endpoint(config)}/${config.bucketName}/${key}`;
@@ -145,15 +144,15 @@ export async function checkExists(
 			);
 			const res = await fetch(signed);
 			if (res.ok) {
-				present.push(hash);
+				return hash;
 			}
 		} catch {
 			// Network error = treat as not present
 		}
+		return null;
 	});
 
-	await Promise.all(checks);
-	return present;
+	return present.filter((hash): hash is string => hash !== null);
 }
 
 /**
