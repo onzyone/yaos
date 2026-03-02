@@ -5,7 +5,7 @@ import type VaultCrdtSyncPlugin from "./main";
 export type ExternalEditPolicy = "always" | "closed-only" | "never";
 
 export interface VaultSyncSettings {
-	/** PartyKit server host, e.g. "https://vault-crdt-sync.yourname.partykit.dev" */
+	/** Cloudflare Worker host, e.g. "https://sync.yourdomain.com" */
 	host: string;
 	/** Shared secret token for auth. */
 	token: string;
@@ -95,13 +95,15 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
+		const authMode = this.plugin.serverAuthMode;
+		const attachmentsAvailable = this.plugin.serverSupportsAttachments;
 
-		containerEl.createEl("h2", { text: "Vault CRDT sync" });
+		containerEl.createEl("h2", { text: "YAOS" });
 
 		new Setting(containerEl)
 			.setName("Server host")
 			.setDesc(
-				"PartyKit server URL (e.g. https://vault-crdt-sync.yourname.partykit.dev or http://127.0.0.1:1999 for local dev).",
+				"Cloudflare Worker sync URL (e.g. https://sync.yourdomain.com or http://127.0.0.1:8787 for local dev).",
 			)
 			.addText((text) =>
 				text
@@ -127,7 +129,13 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Token")
-			.setDesc("Shared secret token. Must match SYNC_TOKEN on the server.")
+			.setDesc(
+				authMode === "unclaimed"
+					? "Leave this blank until you claim the server in a browser, then use the YAOS setup link."
+					: authMode === "env"
+						? "Shared secret token. Must match the SYNC_TOKEN configured on the server."
+						: "Shared secret token. Usually filled automatically by the YAOS setup link after claiming the server.",
+			)
 			.addText((text) =>
 				text
 					.setPlaceholder("your-secret-token")
@@ -205,23 +213,35 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 		containerEl.createEl("h3", { text: "Attachment sync" });
 
-		new Setting(containerEl)
-			.setName("Sync attachments")
-			.setDesc(
-				"Sync non-markdown files (images, PDFs, etc.) via R2 object storage. " +
-				"Requires R2 configuration on the server. Markdown notes always sync via CRDT.",
-			)
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.enableAttachmentSync)
-					.onChange(async (value) => {
-						this.plugin.settings.enableAttachmentSync = value;
-						await this.plugin.saveSettings();
-						this.display();
-					}),
-			);
+		if (this.plugin.settings.host && !attachmentsAvailable) {
+			const note = containerEl.createEl("p", {
+				text:
+					"Attachment sync is unavailable on this server. Add an R2 binding named YAOS_BUCKET in Cloudflare to enable attachments and snapshots.",
+			});
+			note.style.color = "var(--text-muted)";
+			note.style.fontSize = "12px";
+			note.style.marginTop = "-8px";
+		}
 
-		if (this.plugin.settings.enableAttachmentSync) {
+		if (attachmentsAvailable || !this.plugin.settings.host) {
+			new Setting(containerEl)
+				.setName("Sync attachments")
+				.setDesc(
+					"Sync non-markdown files (images, PDFs, etc.) via R2 object storage. " +
+					"Requires R2 configuration on the server. Markdown notes always sync via CRDT.",
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.enableAttachmentSync)
+						.onChange(async (value) => {
+							this.plugin.settings.enableAttachmentSync = value;
+							await this.plugin.saveSettings();
+							this.display();
+						}),
+				);
+		}
+
+		if ((attachmentsAvailable || !this.plugin.settings.host) && this.plugin.settings.enableAttachmentSync) {
 			new Setting(containerEl)
 				.setName("Max attachment size (KB)")
 				.setDesc(
