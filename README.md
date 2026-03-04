@@ -8,7 +8,14 @@ Obsidian already has an excellent paid sync product, and for most people it is t
 
 That design choice is the whole point. Git, cloud drives, timer-based sync plugins, and even tools like Syncthing are fundamentally moving files around. YAOS is built around the idea that note-taking feels better when sync behaves like a live collaborative editor while still preserving a normal local Obsidian vault on disk.
 
-For the deeper design rationale and recent hardening work, see **[ENGINEERING.md](ENGINEERING.md)**.
+## Architecture docs
+
+If you want the design rationale and internals, start with **[ENGINEERING.md](ENGINEERING.md)**.
+
+- **[Monolithic vault CRDT](engineering/monolith.md)**
+- **[Filesystem bridge](engineering/filesystem-bridge.md)**
+- **[Checkpoint + journal persistence](engineering/checkpoint-journal.md)**
+- **[Warts and limits](engineering/warts-and-limits.md)**
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
 
