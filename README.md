@@ -2,16 +2,7 @@
 
 **YAOS makes Obsidian sync feel like Apple Notes or Google Docs.** It is a free, self-hosted, and local-first sync engine that updates your notes instantly across all your devices.
 
-Under the hood, it is a real-time CRDT engine running on Cloudflare Durable Objects.
-
-For the average user, hosting it yourself costs exactly $0/month on Cloudflare's free tier.
-
-### One-click self-hosting
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
-
-- Click this button, then 'Create and deploy'
-- Open the URL created for you, and continue from there.
+Under the hood, it is a real-time CRDT engine running on Cloudflare Durable Objects. For the average user, hosting it yourself costs exactly $0/month on Cloudflare's free tier.
 
 ### Features
 
@@ -23,22 +14,34 @@ For the average user, hosting it yourself costs exactly $0/month on Cloudflare's
 
 If you want the absolute best, zero-effort experience, you should pay for the official Obsidian Sync. If you want a free, instant, local-first alternative that you fully control, this is YAOS.
 
+### Quick Start (5 Minutes)
+
+YAOS requires two things: a free Cloudflare edge server, and the Obsidian plugin. 
+
+**Step 1: Deploy your Server**
+Click this button to deploy your personal sync server. It costs $0 and requires no terminal.
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
+
+**Step 2: Claim your Server**
+Open the URL Cloudflare generates for you. Click "Claim" to generate your secure token and lock the server to you. **Keep this page open.**
+
+**Step 3: Install the Plugin (Beta)**
+*YAOS is currently in the Obsidian Marketplace review queue. To use it today:*
+1. Install **BRAT** from the Obsidian Community Plugins.
+2. Open BRAT settings, click "Add Beta plugin", and paste: `kavinsood/yaos`
+3. Go back to Community Plugins and **enable YAOS**.
+
+**Step 4: Connect**
+Go back to your Claim page and check the box confirming you installed the plugin. Click the "Auto-Configure" button. Obsidian will open, and your vault is now syncing.
+
 ### How is this different from iCloud or Remotely Save?
 
-*Most free ways to sync Obsidian (like Dropbox, iCloud, or community plugins) are just moving files back and forth on a timer. This can lead to conflicted copies and delays in sync.
+*Most free ways to sync Obsidian (like Dropbox, iCloud, or community plugins) are just moving files back and forth on a timer.
+- If you edit on your phone and quickly close the app, the file might not upload. 
+- If you edit the same note on your laptop and your phone, you get an annoying "Conflicted Copy".
 
-YAOS syncs *keystrokes*. If you edit on two devices at once, the text merges flawlessly.
-
-### Installation
-
-After you click deploy:
-
-- The Worker is deployed from this repo to your Cloudflare account.
-- The default deploy is **text sync first**. No R2 bucket is required up front.
-- On first visit to the deployed URL, the server starts in **unclaimed** mode and shows a small setup page.
-- That page generates a token in the browser and gives you a deep link `obsidian://yaos?...`, and a QR code, so you can open on desktop or mobile.
-
-Later, if you want attachments and snapshots, add an R2 binding named `YAOS_BUCKET` in the Cloudflare dashboard and redeploy. The same deployed Worker will begin reporting those features as available.
+**YAOS syncs keystrokes, not files.** If you edit on two devices at once, the text merges flawlessly. Go offline for days, and everything reconciles mathematically when you reconnect.
 
 If you want the design rationale and internals, read these:
 
