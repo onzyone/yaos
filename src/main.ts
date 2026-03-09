@@ -55,6 +55,12 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 
 /** Minimum interval between reconcile runs (prevents rapid reconnect churn). */
 const RECONCILE_COOLDOWN_MS = 10_000;
+const FAST_RECONNECT_DEBOUNCE_MS = 1_000;
+const FAST_RECONNECT_JITTER_MS = 500;
+const FAST_RECONNECT_MIN_INTERVAL_MS = 2_000;
+const MARKDOWN_DIRTY_SETTLE_MS = 350;
+const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
+const BOUND_RECOVERY_LOCK_MS = 1500;
 
 export default class VaultCrdtSyncPlugin extends Plugin {
 	settings: VaultSyncSettings = DEFAULT_SETTINGS;
@@ -92,6 +98,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	/** Visibility change handler reference for cleanup. */
 	private visibilityHandler: (() => void) | null = null;
+	private onlineHandler: (() => void) | null = null;
+	private offlineHandler: (() => void) | null = null;
+	private fastReconnectDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+	private fastReconnectConnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private lastFastReconnectAt = 0;
 
 	/** Track the set of currently observed file paths for disk mirror cleanup. */
 	private openFilePaths = new Set<string>();
@@ -119,6 +130,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	/** Coalesced markdown disk events awaiting import into CRDT. */
 	private dirtyMarkdownPaths = new Map<string, "create" | "modify">();
 	private markdownDrainPromise: Promise<void> | null = null;
+	private markdownDrainTimer: ReturnType<typeof setTimeout> | null = null;
+	private lastMarkdownDirtyAt = 0;
+	private boundRecoveryLocks = new Map<string, number>();
 
 	/** Last time a reconciliation completed (for cooldown). */
 	private lastReconcileTime = 0;
@@ -128,6 +142,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	/** In-memory ring of recent high-level plugin events. */
 	private eventRing: Array<{ ts: string; msg: string }> = [];
+	private lastReconcileStats: {
+		at: string;
+		mode: ReconcileMode;
+		plannedCreates: number;
+		plannedUpdates: number;
+		flushedCreates: number;
+		flushedUpdates: number;
+		safetyBrakeTriggered: boolean;
+		safetyBrakeReason: string | null;
+	} | null = null;
 
 	/** Persistent trace journal/state writer (active when debug is enabled). */
 	private traceLogger: PersistentTraceLogger | null = null;
@@ -138,6 +162,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private recentServerTrace: unknown[] = [];
 	private serverCapabilities: ServerCapabilities | null = null;
 	private commandsRegistered = false;
+	private idbDegradedHandled = false;
 
 	/**
 	 * True when startup timed out waiting for provider sync.
@@ -230,6 +255,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async initSync(): Promise<void> {
 		try {
+			this.idbDegradedHandled = false;
 			await this.refreshServerCapabilities();
 			this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
 			this.maxFileSize = this.settings.maxFileSizeKB * 1024;
@@ -331,6 +357,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			// 10. Visibility change: force reconnect on foreground
 			this.setupVisibilityHandler();
+			this.setupNetworkHandlers();
 
 			// -----------------------------------------------------------
 			// STARTUP SEQUENCE
@@ -353,6 +380,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// Check for fatal auth error before waiting for provider
 			if (this.vaultSync.fatalAuthError) {
 				this.log("Fatal auth error during startup");
+				if (this.vaultSync.fatalAuthCode === "update_required") {
+					this.updateStatusBar("error");
+					this.showFatalSyncNotice();
+					return;
+				}
 				this.updateStatusBar("unauthorized");
 				this.showFatalSyncNotice();
 				// Still reconcile with whatever we have locally
@@ -374,7 +406,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			);
 
 			if (this.vaultSync.fatalAuthError) {
-				this.updateStatusBar("unauthorized");
+				this.updateStatusBar(this.vaultSync.fatalAuthCode === "update_required" ? "error" : "unauthorized");
 				this.showFatalSyncNotice();
 				return;
 			}
@@ -497,6 +529,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * sleep/wake where sockets silently die.
 	 */
 	private setupVisibilityHandler(): void {
+		if (this.visibilityHandler) {
+			document.removeEventListener("visibilitychange", this.visibilityHandler);
+		}
+
 		this.visibilityHandler = () => {
 			if (document.visibilityState === "hidden") {
 				void this.diskMirror?.flushOpenWrites("app-backgrounded");
@@ -506,11 +542,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			if (!this.vaultSync) return;
 			if (this.vaultSync.fatalAuthError) return;
 
-			if (!this.vaultSync.connected) {
-				this.log("App foregrounded — provider disconnected, forcing reconnect");
-				this.vaultSync.provider.disconnect();
-				this.vaultSync.provider.connect();
-			}
+			this.requestFastReconnect("app-foregrounded");
 		};
 
 		document.addEventListener("visibilitychange", this.visibilityHandler);
@@ -518,7 +550,87 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			if (this.visibilityHandler) {
 				document.removeEventListener("visibilitychange", this.visibilityHandler);
 			}
+			});
+	}
+
+	private setupNetworkHandlers(): void {
+		if (this.onlineHandler) {
+			window.removeEventListener("online", this.onlineHandler);
+		}
+		if (this.offlineHandler) {
+			window.removeEventListener("offline", this.offlineHandler);
+		}
+
+		this.onlineHandler = () => {
+			this.log("Network online event — requesting fast reconnect");
+			this.scheduleTraceStateSnapshot("network-online");
+			this.requestFastReconnect("network-online");
+		};
+
+		this.offlineHandler = () => {
+			this.log("Network offline event — marking status offline");
+			this.scheduleTraceStateSnapshot("network-offline");
+			if (this.vaultSync?.fatalAuthError) {
+				this.refreshStatusBar();
+				return;
+			}
+			this.updateStatusBar("offline");
+		};
+
+		window.addEventListener("online", this.onlineHandler);
+		window.addEventListener("offline", this.offlineHandler);
+		this.register(() => {
+			if (this.onlineHandler) {
+				window.removeEventListener("online", this.onlineHandler);
+			}
+			if (this.offlineHandler) {
+				window.removeEventListener("offline", this.offlineHandler);
+			}
 		});
+	}
+
+	private requestFastReconnect(reason: "app-foregrounded" | "network-online"): void {
+		if (!this.vaultSync) return;
+		if (this.vaultSync.fatalAuthError) {
+			this.log(`Fast reconnect skipped (${reason}): fatal auth (${this.vaultSync.fatalAuthCode ?? "unknown"})`);
+			return;
+		}
+		if (this.vaultSync.connected || this.vaultSync.provider.wsconnecting) {
+			return;
+		}
+
+		const now = Date.now();
+		if (now - this.lastFastReconnectAt < FAST_RECONNECT_MIN_INTERVAL_MS) {
+			return;
+		}
+
+		if (this.fastReconnectDebounceTimer) {
+			clearTimeout(this.fastReconnectDebounceTimer);
+		}
+		this.fastReconnectDebounceTimer = setTimeout(() => {
+			this.fastReconnectDebounceTimer = null;
+
+			const sync = this.vaultSync;
+			if (!sync) return;
+			if (sync.fatalAuthError) return;
+			if (sync.connected || sync.provider.wsconnecting) return;
+
+			this.lastFastReconnectAt = Date.now();
+			this.log(`Fast reconnect triggered (${reason})`);
+			sync.provider.disconnect();
+
+			if (this.fastReconnectConnectTimer) {
+				clearTimeout(this.fastReconnectConnectTimer);
+			}
+			this.fastReconnectConnectTimer = setTimeout(() => {
+				this.fastReconnectConnectTimer = null;
+				const live = this.vaultSync;
+				if (!live || live !== sync) return;
+				if (live.fatalAuthError) return;
+				if (live.connected || live.provider.wsconnecting) return;
+				live.provider.connect();
+			}, FAST_RECONNECT_JITTER_MS);
+		}, FAST_RECONNECT_DEBOUNCE_MS);
 	}
 
 	// -------------------------------------------------------------------
@@ -657,11 +769,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.log(`reconcile: ${skippedByIndex} files unchanged (stat match), ${changed.length} changed`);
 			}
 
-			this.log(
-				`Reconciling [${mode}]: diskPresent=${diskPresentPaths.size}, ` +
-				`diskLoaded=${diskFiles.size} (${changed.length} read) vs ` +
-				`${this.vaultSync.pathToId.size} CRDT paths`,
-			);
+				this.log(
+					`Reconciling [${mode}]: diskPresent=${diskPresentPaths.size}, ` +
+					`diskLoaded=${diskFiles.size} (${changed.length} read) vs ` +
+					`${this.vaultSync.getActiveMarkdownPaths().length} CRDT paths`,
+				);
 
 			const result = this.vaultSync.reconcileVault(
 				diskFiles,
@@ -670,27 +782,52 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.settings.deviceName,
 			);
 
-			// Safety brake: large create-on-disk batches are usually a signal that
-			// presence bookkeeping is wrong or stale. Abort destructive writeback.
-			const crdtPathCount = this.vaultSync.pathToId.size;
-			const writeCount = result.createdOnDisk.length + result.updatedOnDisk.length;
-			const writeRatio = crdtPathCount > 0 ? (writeCount / crdtPathCount) : 0;
-			if (writeCount > 20 && writeRatio > 0.25) {
-				const msg =
-					`Reconcile safety brake: refusing to write ${writeCount} ` +
-					`files to disk (${Math.round(writeRatio * 100)}% of CRDT paths).`;
-				this.log(msg);
-				console.error(`[yaos] ${msg}`);
-				new Notice(`YAOS: ${msg} Run "Export sync diagnostics" and inspect logs.`);
-				// Continue with non-destructive state updates below; skip flushWrite loop.
-			} else {
+				// Safety brake: evaluate only destructive disk operations.
+				// Creating missing files from CRDT is additive and should not be blocked.
+				let flushedCreates = 0;
+				let flushedUpdates = 0;
+				let safetyBrakeTriggered = false;
+				let safetyBrakeReason: string | null = null;
+
+				const localFileCount = diskPresentPaths.size;
+				const destructiveCount = result.updatedOnDisk.length;
+				const destructiveRatio = localFileCount > 0
+					? destructiveCount / localFileCount
+					: 0;
+				if (destructiveCount > 20 && destructiveRatio > 0.25) {
+					safetyBrakeTriggered = true;
+					safetyBrakeReason =
+						`refusing to overwrite ${destructiveCount} local files ` +
+						`(${Math.round(destructiveRatio * 100)}% of disk files)`;
+					this.log(`Reconcile safety brake: ${safetyBrakeReason}.`);
+					console.error(`[yaos] Reconcile safety brake: ${safetyBrakeReason}.`);
+					new Notice(
+						`YAOS: Reconcile safety brake — ${safetyBrakeReason}. ` +
+						`Additive creates will continue. Export diagnostics and inspect logs.`,
+					);
+				}
+
 				for (const path of result.createdOnDisk) {
 					await this.diskMirror.flushWrite(path);
+					flushedCreates++;
 				}
-				for (const path of result.updatedOnDisk) {
-					await this.diskMirror.flushWrite(path);
+				if (!safetyBrakeTriggered) {
+					for (const path of result.updatedOnDisk) {
+						await this.diskMirror.flushWrite(path);
+						flushedUpdates++;
+					}
 				}
-			}
+
+				this.lastReconcileStats = {
+					at: new Date().toISOString(),
+					mode,
+					plannedCreates: result.createdOnDisk.length,
+					plannedUpdates: result.updatedOnDisk.length,
+					flushedCreates,
+					flushedUpdates,
+					safetyBrakeTriggered,
+					safetyBrakeReason,
+				};
 
 			this.untrackedFiles = result.untracked;
 			this.reconciled = true;
@@ -708,14 +845,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				);
 			}
 
-			this.log(
-				`Reconciliation [${mode}] complete: ` +
-				`${result.seededToCrdt.length} seeded, ` +
-				`${result.createdOnDisk.length} created on disk, ` +
-				`${result.updatedOnDisk.length} updated on disk, ` +
-				`${result.untracked.length} untracked, ` +
-				`${result.skipped} tombstoned`,
-			);
+				this.log(
+					`Reconciliation [${mode}] complete: ` +
+					`${result.seededToCrdt.length} seeded, ` +
+					`creates planned/flushed=${result.createdOnDisk.length}/${flushedCreates}, ` +
+					`updates planned/flushed=${result.updatedOnDisk.length}/${flushedUpdates}, ` +
+					`${result.untracked.length} untracked, ` +
+					`${result.skipped} tombstoned` +
+					(safetyBrakeTriggered ? ", safety-brake=on" : ", safety-brake=off"),
+				);
 
 			// Blob reconciliation (if enabled)
 			if (this.blobSync) {
@@ -1069,6 +1207,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			clearTimeout(this.reconcileCooldownTimer);
 			this.reconcileCooldownTimer = null;
 		}
+		if (this.markdownDrainTimer) {
+			clearTimeout(this.markdownDrainTimer);
+			this.markdownDrainTimer = null;
+		}
+		if (this.fastReconnectDebounceTimer) {
+			clearTimeout(this.fastReconnectDebounceTimer);
+			this.fastReconnectDebounceTimer = null;
+		}
+		if (this.fastReconnectConnectTimer) {
+			clearTimeout(this.fastReconnectConnectTimer);
+			this.fastReconnectConnectTimer = null;
+		}
 
 		this.vaultSync?.destroy();
 
@@ -1084,6 +1234,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.awaitingFirstProviderSyncAfterStartup = false;
 		this.openFilePaths.clear();
 		this.activeMarkdownPath = null;
+		this.dirtyMarkdownPaths.clear();
+		this.idbDegradedHandled = false;
 
 		this.updateStatusBar("disconnected");
 	}
@@ -1156,6 +1308,26 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			name: "Export sync diagnostics",
 			callback: () => {
 				void this.exportDiagnostics();
+			},
+		});
+
+		this.addCommand({
+			id: "yaos-migrate-schema-v2",
+			name: "Migrate sync schema to v2",
+			callback: () => {
+				void this.runSchemaMigrationToV2();
+			},
+		});
+
+		this.addCommand({
+			id: "yaos-debug-vfs-torture-test",
+			name: "Run VFS torture test (debug)",
+			checkCallback: (checking: boolean) => {
+				if (!this.settings.debug) return false;
+				if (!checking) {
+					void this.runVfsTortureTest();
+				}
+				return true;
 			},
 		});
 
@@ -1289,7 +1461,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					return;
 				}
 
-				const pathCount = this.vaultSync.pathToId.size;
+					const pathCount = this.vaultSync.getActiveMarkdownPaths().length;
 				new ConfirmModal(
 					this.app,
 					"Nuclear reset",
@@ -1324,10 +1496,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 						this.log("Nuclear reset: reinitializing (will re-seed from disk)");
 						await this.initSync();
-						new Notice(
-							`YAOS: nuclear reset complete. ` +
-							`Re-seeded ${this.vaultSync?.pathToId.size ?? 0} files from disk.`,
-						);
+							new Notice(
+								`YAOS: nuclear reset complete. ` +
+								`Re-seeded ${this.vaultSync?.getActiveMarkdownPaths().length ?? 0} files from disk.`,
+							);
 					},
 				).open();
 			},
@@ -1399,32 +1571,36 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
-	private async markMarkdownDirty(file: TFile, reason: "create" | "modify"): Promise<void> {
-		// Coalesce local markdown filesystem bursts by path and let one async
-		// drain loop consume them at real I/O speed instead of using fixed
-		// debounce delays for every modify/create event.
+	private markMarkdownDirty(file: TFile, reason: "create" | "modify"): void {
+		// Coalesce local markdown filesystem bursts by path and only start the
+		// drain once the path set has been quiet for a short settle window.
 		const previous = this.dirtyMarkdownPaths.get(file.path);
 		if (previous !== "create") {
 			this.dirtyMarkdownPaths.set(file.path, reason);
 		}
-
-		if (this.markdownDrainPromise) return;
-
-		this.markdownDrainPromise = this.drainDirtyMarkdownPaths()
-			.catch((err) => {
-				console.error("[yaos] markdown drain failed:", err);
-			})
-			.finally(() => {
-				this.markdownDrainPromise = null;
-				if (this.dirtyMarkdownPaths.size > 0) {
-					void this.markMarkdownDrainPending();
-				}
-			});
-
-		await this.markdownDrainPromise;
+		this.lastMarkdownDirtyAt = Date.now();
+		this.scheduleMarkdownDrain();
 	}
 
-	private async markMarkdownDrainPending(): Promise<void> {
+	private scheduleMarkdownDrain(): void {
+		if (this.markdownDrainTimer) {
+			clearTimeout(this.markdownDrainTimer);
+		}
+		const elapsed = Date.now() - this.lastMarkdownDirtyAt;
+		const delay = Math.max(0, MARKDOWN_DIRTY_SETTLE_MS - elapsed);
+		this.markdownDrainTimer = setTimeout(() => {
+			this.markdownDrainTimer = null;
+			const sinceLastDirty = Date.now() - this.lastMarkdownDirtyAt;
+			if (sinceLastDirty < MARKDOWN_DIRTY_SETTLE_MS) {
+				// Enforce a strict trailing-edge quiet window before ingest.
+				this.scheduleMarkdownDrain();
+				return;
+			}
+			this.kickMarkdownDrain();
+		}, delay);
+	}
+
+	private kickMarkdownDrain(): void {
 		if (this.markdownDrainPromise) return;
 		this.markdownDrainPromise = this.drainDirtyMarkdownPaths()
 			.catch((err) => {
@@ -1433,22 +1609,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			.finally(() => {
 				this.markdownDrainPromise = null;
 				if (this.dirtyMarkdownPaths.size > 0) {
-					void this.markMarkdownDrainPending();
+					this.scheduleMarkdownDrain();
 				}
 			});
-		await this.markdownDrainPromise;
 	}
 
 	private async drainDirtyMarkdownPaths(): Promise<void> {
-		while (this.dirtyMarkdownPaths.size > 0) {
-			// Clear the batch before processing so any new events that arrive
-			// while reads are in flight re-dirty the path for the next pass.
-			const batch = Array.from(this.dirtyMarkdownPaths.entries());
-			this.dirtyMarkdownPaths.clear();
+		if (this.dirtyMarkdownPaths.size === 0) return;
+		// Process one snapshot batch only. Any new events that arrive while this
+		// batch is in flight are handled by the next trailing-edge timer window.
+		const batch = Array.from(this.dirtyMarkdownPaths.entries());
+		this.dirtyMarkdownPaths.clear();
 
-			for (const [path, reason] of batch) {
-				await this.processDirtyMarkdownPath(path, reason);
-			}
+		for (const [path, reason] of batch) {
+			await this.processDirtyMarkdownPath(path, reason);
 		}
 	}
 
@@ -1571,6 +1745,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		content: string,
 		existingText: ReturnType<VaultSync["getTextForPath"]>,
 	): Promise<boolean> {
+		const now = Date.now();
+		const lockUntil = this.boundRecoveryLocks.get(file.path) ?? 0;
+		if (lockUntil > now) {
+			this.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, recovery lock)`);
+			return true;
+		}
+		if (lockUntil > 0) {
+			this.boundRecoveryLocks.delete(file.path);
+		}
+
 		const openViews = this.getOpenMarkdownViewsForPath(file.path);
 		if (openViews.length === 0) {
 			this.trace("trace", "stale-bound-path-without-open-view", {
@@ -1583,6 +1767,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		const crdtContent = existingText?.toString() ?? null;
 		if (crdtContent === content) {
+			this.boundRecoveryLocks.delete(file.path);
 			this.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, crdt-current)`);
 			return true;
 		}
@@ -1641,6 +1826,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.settings.deviceName,
 				);
 				}
+			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
 
 				for (const state of localOnlyViews) {
 					const repaired = this.editorBindings?.heal(
@@ -1665,7 +1851,35 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			(state) => state.editorMatchesCrdt && !state.editorMatchesDisk,
 		);
 		if (crdtOnlyViews.length > 0) {
-			this.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, disk lag)`);
+			const lastEditorActivity = this.editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
+			const hasRecentEditorActivity = lastEditorActivity != null
+				&& (Date.now() - lastEditorActivity) < OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS;
+			if (hasRecentEditorActivity) {
+				this.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, disk lag)`);
+				return true;
+			}
+
+			// Active editor is open but idle; treat disk as an external edit
+			// and ingest it into CRDT instead of deferring forever.
+			if (existingText) {
+				this.log(
+					`syncFileFromDisk: recovering "${file.path}" ` +
+					`(editor-bound external disk edit while idle: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
+				);
+				applyDiffToYText(existingText, crdtContent ?? "", content, "disk-sync-open-idle-recover");
+			} else {
+				this.log(
+					`syncFileFromDisk: recovering "${file.path}" ` +
+					`(editor-bound idle disk edit, missing CRDT text: seeding ${content.length} chars)`,
+				);
+				this.vaultSync?.ensureFile(
+					file.path,
+					content,
+					this.settings.deviceName,
+				);
+			}
+			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
+			this.scheduleTraceStateSnapshot("bound-file-open-idle-disk-recovery");
 			return true;
 		}
 
@@ -1724,6 +1938,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		if (this.vaultSync.fatalAuthError) {
 			this.updateStatusBar("unauthorized");
+			return;
+		}
+
+		// IndexedDB persistence failure is a hard degraded state for durability.
+		if (this.vaultSync.idbError) {
+			this.handleIndexedDbDegraded("status-check");
+			this.updateStatusBar("error");
 			return;
 		}
 
@@ -1796,6 +2017,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		void this.refreshServerTrace();
 
 		const errorHandler = (event: ErrorEvent) => {
+			if (this.isIndexedDbRelatedError(event.error ?? event.message)) {
+				this.trace("trace", "window-error-indexeddb", {
+					message: event.message,
+					filename: event.filename,
+					lineno: event.lineno,
+					colno: event.colno,
+				});
+				this.handleIndexedDbDegraded("window-error", event.error ?? event.message);
+				this.scheduleTraceStateSnapshot("window-error-indexeddb");
+				event.preventDefault();
+				return;
+			}
 			this.trace("trace", "window-error", {
 				message: event.message,
 				filename: event.filename,
@@ -1811,6 +2044,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		};
 
 		const rejectionHandler = (event: PromiseRejectionEvent) => {
+			if (this.isIndexedDbRelatedError(event.reason)) {
+				this.trace("trace", "unhandled-rejection-indexeddb", {
+					reason: String(event.reason),
+				});
+				this.handleIndexedDbDegraded("unhandled-rejection", event.reason);
+				this.scheduleTraceStateSnapshot("unhandled-rejection-indexeddb");
+				event.preventDefault();
+				return;
+			}
 			this.trace("trace", "unhandled-rejection", {
 				reason: String(event.reason),
 			});
@@ -2094,6 +2336,50 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.serverCapabilities?.snapshots ?? true;
 	}
 
+	buildSetupDeepLink(): string | null {
+		const host = this.settings.host?.trim().replace(/\/$/, "");
+		const token = this.settings.token?.trim();
+		const vaultId = this.settings.vaultId?.trim();
+		if (!host || !token || !vaultId) return null;
+		const params = new URLSearchParams({
+			action: "setup",
+			host,
+			token,
+			vaultId,
+		});
+		return `obsidian://yaos?${params.toString()}`;
+	}
+
+	buildMobileSetupUrl(): string | null {
+		const host = this.settings.host?.trim().replace(/\/$/, "");
+		const token = this.settings.token?.trim();
+		const vaultId = this.settings.vaultId?.trim();
+		if (!host || !token || !vaultId) return null;
+		const hash = new URLSearchParams({
+			host,
+			token,
+			vaultId,
+		});
+		return `${host}/mobile-setup#${hash.toString()}`;
+	}
+
+	buildRecoveryKitText(): string | null {
+		const host = this.settings.host?.trim().replace(/\/$/, "");
+		const token = this.settings.token?.trim();
+		const vaultId = this.settings.vaultId?.trim();
+		if (!host || !token || !vaultId) return null;
+		return [
+			"YAOS Recovery Kit",
+			`Created: ${new Date().toISOString()}`,
+			"",
+			`Host: ${host}`,
+			`Token: ${token}`,
+			`Vault ID: ${vaultId}`,
+			"",
+			"Keep this in a password manager. You need host + token + vault ID to recover this sync room on a new device.",
+		].join("\n");
+	}
+
 	private createBlobSyncManager(): BlobSyncManager | null {
 		if (!this.vaultSync) return null;
 		if (!this.settings.host || !this.settings.token) return null;
@@ -2182,13 +2468,45 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private async handleSetupLink(params: Record<string, string>): Promise<void> {
 		const host = typeof params.host === "string" ? params.host.trim() : "";
 		const token = typeof params.token === "string" ? params.token.trim() : "";
+		const incomingVaultId = typeof params.vaultId === "string" ? params.vaultId.trim() : "";
 		if (!host || !token) {
 			new Notice("YAOS: setup link is missing host or token.");
 			return;
 		}
+		if (!incomingVaultId) {
+			new Notice(
+				"YAOS: setup link is missing vault ID. This may create a separate sync room on this device.",
+				8000,
+			);
+		}
+
+		const currentVaultId = this.settings.vaultId?.trim() ?? "";
+		if (incomingVaultId && currentVaultId && incomingVaultId !== currentVaultId) {
+			const localMarkdownCount = this.app.vault
+				.getMarkdownFiles()
+				.filter((file) => isMarkdownSyncable(file.path, this.excludePatterns))
+				.length;
+			if (localMarkdownCount > 5) {
+				const confirmed = window.confirm(
+					`YAOS pairing link points to a different Vault ID.\n\n` +
+					`Current: ${currentVaultId}\n` +
+					`Incoming: ${incomingVaultId}\n\n` +
+					`This vault currently has ${localMarkdownCount} local markdown files. ` +
+					`Switching rooms may pull a different remote state.\n\n` +
+					`Continue and switch to the incoming Vault ID?`,
+				);
+				if (!confirmed) {
+					new Notice("YAOS: pairing cancelled. Vault ID unchanged.", 6000);
+					return;
+				}
+			}
+		}
 
 		this.settings.host = host.replace(/\/$/, "");
 		this.settings.token = token;
+		if (incomingVaultId) {
+			this.settings.vaultId = incomingVaultId;
+		}
 		await this.refreshServerCapabilities();
 		await this.saveSettings();
 		this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
@@ -2216,6 +2534,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		if (code === "server_misconfigured") {
 			new Notice("YAOS: server misconfigured.");
+			return;
+		}
+		if (code === "update_required") {
+			const details = this.vaultSync?.fatalAuthDetails;
+			const detailText =
+				details && (details.roomSchemaVersion !== null || details.clientSchemaVersion !== null)
+					? ` (client=${details.clientSchemaVersion ?? "unknown"}, room=${details.roomSchemaVersion ?? "unknown"})`
+					: "";
+			new Notice(
+				`YAOS: this vault was upgraded by a newer plugin schema${detailText}. ` +
+				"Update YAOS on this device to continue syncing.",
+				12000,
+			);
 			return;
 		}
 
@@ -2289,10 +2620,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`Reconciled: ${this.reconciled}`,
 			`Connection generation: ${this.vaultSync.connectionGeneration}`,
 			`Last reconciled gen: ${this.lastReconciledGeneration}`,
-			`Fatal auth error: ${this.vaultSync.fatalAuthError}`,
-			`IndexedDB error: ${this.vaultSync.idbError}`,
-			`CRDT paths: ${this.vaultSync.pathToId.size}`,
-			`Blob paths: ${this.vaultSync.pathToBlob.size}`,
+				`Fatal auth error: ${this.vaultSync.fatalAuthError}`,
+				`Fatal auth code: ${this.vaultSync.fatalAuthCode ?? "(none)"}`,
+				`IndexedDB error: ${this.vaultSync.idbError}`,
+				`IndexedDB error kind: ${this.vaultSync.idbErrorDetails?.kind ?? "(none)"}`,
+				`IndexedDB error phase: ${this.vaultSync.idbErrorDetails?.phase ?? "(none)"}`,
+				`IndexedDB error name: ${this.vaultSync.idbErrorDetails?.name ?? "(none)"}`,
+				`IndexedDB error message: ${this.vaultSync.idbErrorDetails?.message ?? "(none)"}`,
+				`Schema supported/local: ${this.vaultSync.supportedSchemaVersion}/${this.vaultSync.storedSchemaVersion ?? "(unset)"}`,
+				`CRDT paths: ${this.vaultSync.getActiveMarkdownPaths().length}`,
+				`Blob paths: ${this.vaultSync.pathToBlob.size}`,
 			`Untracked files: ${this.untrackedFiles.length}`,
 			`Active disk observers: ${this.diskMirror?.activeObserverCount ?? 0}`,
 			`External edit policy: ${this.settings.externalEditPolicy}`,
@@ -2341,12 +2678,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const diskFiles = this.app.vault.getMarkdownFiles()
 			.filter((f) => isMarkdownSyncable(f.path, this.excludePatterns));
 
-		const crdtPaths = new Set<string>();
-		this.vaultSync.pathToId.forEach((_id, path) => {
-			if (isMarkdownSyncable(path, this.excludePatterns)) {
-				crdtPaths.add(path);
-			}
-		});
+		const crdtPaths = new Set<string>(
+			this.vaultSync.getActiveMarkdownPaths().filter((path) =>
+				isMarkdownSyncable(path, this.excludePatterns),
+			),
+		);
 
 		const diskHashes = new Map<string, { hash: string; length: number }>();
 		for (const file of diskFiles) {
@@ -2420,6 +2756,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				reconciled: this.reconciled,
 				reconcileInFlight: this.reconcileInFlight,
 				reconcilePending: this.reconcilePending,
+				lastReconcile: this.lastReconcileStats,
 				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 				lastReconciledGeneration: this.lastReconciledGeneration,
 				connected: this.vaultSync.connected,
@@ -2427,11 +2764,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				localReady: this.vaultSync.localReady,
 				connectionGeneration: this.vaultSync.connectionGeneration,
 				fatalAuthError: this.vaultSync.fatalAuthError,
+				fatalAuthCode: this.vaultSync.fatalAuthCode,
+				fatalAuthDetails: this.vaultSync.fatalAuthDetails,
 				idbError: this.vaultSync.idbError,
+				idbErrorDetails: this.vaultSync.idbErrorDetails,
 				pathToIdCount: this.vaultSync.pathToId.size,
+				activePathCount: this.vaultSync.getActiveMarkdownPaths().length,
 				blobPathCount: this.vaultSync.pathToBlob.size,
 				diskFileCount: diskFiles.length,
 				openFileCount: this.openFilePaths.size,
+				schema: {
+					supportedByClient: this.vaultSync.supportedSchemaVersion,
+					storedInDoc: this.vaultSync.storedSchemaVersion,
+				},
 			},
 			hashDiff: {
 				missingOnDisk,
@@ -2450,10 +2795,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			serverTrace: this.recentServerTrace,
 		};
 
-		const diagDir = normalizePath(`${this.app.vault.configDir}/plugins/yaos/diagnostics`);
-		if (!(await this.app.vault.adapter.exists(diagDir))) {
-			await this.app.vault.adapter.mkdir(diagDir);
-		}
+		const diagDir = await this.ensureDiagnosticsDir();
 
 		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 		const fileName = `sync-diagnostics-${stamp}-${this.settings.deviceName || "device"}.json`;
@@ -2465,6 +2807,294 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`(missingOnDisk=${missingOnDisk.length}, missingInCrdt=${missingInCrdt.length}, mismatches=${hashMismatches.length})`,
 		);
 		new Notice(`Sync diagnostics exported to ${outPath}`, 10000);
+	}
+
+	private async runSchemaMigrationToV2(): Promise<void> {
+		if (!this.vaultSync) {
+			new Notice("Sync not initialized.");
+			return;
+		}
+
+		const fromVersion = this.vaultSync.storedSchemaVersion;
+		if (fromVersion !== null && fromVersion >= 2) {
+			new Notice("YAOS: this vault is already on schema v2.");
+			return;
+		}
+
+		new ConfirmModal(
+			this.app,
+			"Migrate sync schema to v2",
+			"This will switch this vault to schema v2 and block older YAOS clients from syncing " +
+			"until they are upgraded. YAOS will export diagnostics before and after migration. Continue?",
+			async () => {
+				if (!this.vaultSync) return;
+
+				try {
+					new Notice("YAOS: exporting pre-migration diagnostics...", 7000);
+					await this.exportDiagnostics();
+				} catch (err) {
+					this.log(`schema migration: preflight diagnostics export failed: ${String(err)}`);
+				}
+
+				const result = this.vaultSync.migrateSchemaToV2(this.settings.deviceName);
+				this.log(
+					`schema migration result: ${JSON.stringify(result)}`,
+				);
+				const loserCleanupCount = await this.cleanupMigrationLoserPaths(result.loserPaths);
+				if (loserCleanupCount > 0) {
+					this.log(`schema migration: removed ${loserCleanupCount} loser-path file(s) from disk`);
+				}
+
+				const mode = this.vaultSync.getSafeReconcileMode();
+				await this.runReconciliation(mode);
+				this.bindAllOpenEditors();
+				this.validateAllOpenBindings("schema-migration");
+
+				try {
+					new Notice("YAOS: exporting post-migration diagnostics...", 7000);
+					await this.exportDiagnostics();
+				} catch (err) {
+					this.log(`schema migration: postflight diagnostics export failed: ${String(err)}`);
+				}
+
+				new Notice(
+					`YAOS: schema v2 migration complete` +
+					(loserCleanupCount > 0 ? ` (${loserCleanupCount} local alias file(s) cleaned).` : ".") +
+					" Update YAOS on your other devices before reconnecting them.",
+					12000,
+				);
+			},
+		).open();
+	}
+
+	private async cleanupMigrationLoserPaths(paths: string[]): Promise<number> {
+		if (paths.length === 0) return 0;
+		let removed = 0;
+		for (const path of paths) {
+			const node = this.app.vault.getAbstractFileByPath(path);
+			if (!(node instanceof TFile)) continue;
+			try {
+				await this.app.vault.delete(node, true);
+				removed++;
+			} catch (err) {
+				this.log(`schema migration: failed to remove loser path "${path}": ${String(err)}`);
+			}
+		}
+		return removed;
+	}
+
+	private async ensureDiagnosticsDir(): Promise<string> {
+		const diagDir = normalizePath(`${this.app.vault.configDir}/plugins/yaos/diagnostics`);
+		if (!(await this.app.vault.adapter.exists(diagDir))) {
+			await this.app.vault.adapter.mkdir(diagDir);
+		}
+		return diagDir;
+	}
+
+	private async runVfsTortureTest(): Promise<void> {
+		if (!this.vaultSync) {
+			new Notice("Sync not initialized");
+			return;
+		}
+
+		const startedAt = Date.now();
+		const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(16).slice(2, 8)}`;
+		const rootDir = normalizePath(`YAOS QA/vfs-torture-${runId}`);
+		const steps: Array<{
+			name: string;
+			status: "ok" | "error" | "skipped";
+			timestamp: string;
+			durationMs: number;
+			detail: string;
+		}> = [];
+
+		const ensureFolder = async (folderPath: string): Promise<void> => {
+			const normalized = normalizePath(folderPath);
+			if (!normalized) return;
+			const segments = normalized.split("/").filter(Boolean);
+			let current = "";
+			for (const segment of segments) {
+				current = current ? `${current}/${segment}` : segment;
+				if (!this.app.vault.getAbstractFileByPath(current)) {
+					await this.app.vault.createFolder(current);
+				}
+			}
+		};
+
+		const runStep = async (
+			name: string,
+			fn: () => Promise<string | void>,
+		): Promise<void> => {
+			const stepStartedAt = Date.now();
+			try {
+				const detail = (await fn()) ?? "";
+				steps.push({
+					name,
+					status: "ok",
+					timestamp: new Date().toISOString(),
+					durationMs: Date.now() - stepStartedAt,
+					detail,
+				});
+			} catch (err) {
+				const detail = err instanceof Error ? err.stack ?? err.message : String(err);
+				steps.push({
+					name,
+					status: "error",
+					timestamp: new Date().toISOString(),
+					durationMs: Date.now() - stepStartedAt,
+					detail,
+				});
+				this.log(`VFS torture step failed [${name}]: ${detail}`);
+			}
+		};
+
+		new Notice("YAOS: running VFS torture test...");
+		this.log(`VFS torture: starting run ${runId} in "${rootDir}"`);
+
+		await runStep("Create sandbox folder structure", async () => {
+			await ensureFolder(rootDir);
+			await ensureFolder(`${rootDir}/rename-source/nested`);
+			return `Created sandbox at ${rootDir}`;
+		});
+
+		await runStep("Burst edit markdown file", async () => {
+			const burstPath = normalizePath(`${rootDir}/burst.md`);
+			const burstFile = await this.app.vault.create(
+				burstPath,
+				"# YAOS burst test\n\nStart of burst edits.",
+			);
+			for (let i = 1; i <= 10; i++) {
+				const current = await this.app.vault.read(burstFile);
+				await this.app.vault.modify(
+					burstFile,
+					`${current}\n- burst edit ${i} @ ${new Date().toISOString()}`,
+				);
+			}
+			return `Applied 10 rapid app-level writes to ${burstPath}`;
+		});
+
+		await runStep("Rapid create/rename/edit sequence", async () => {
+			const untitledPath = normalizePath(`${rootDir}/Untitled.md`);
+			const renamedPath = normalizePath(`${rootDir}/Meeting Notes.md`);
+			const untitledFile = await this.app.vault.create(
+				untitledPath,
+				"# Quick rename flow\n\nseed",
+			);
+			await this.app.vault.modify(untitledFile, "# Quick rename flow\n\nseed\nline 1");
+			await this.app.fileManager.renameFile(untitledFile, renamedPath);
+			const renamedFile = this.app.vault.getAbstractFileByPath(renamedPath);
+			if (!(renamedFile instanceof TFile)) {
+				throw new Error(`Expected renamed file at "${renamedPath}"`);
+			}
+			const current = await this.app.vault.read(renamedFile);
+			await this.app.vault.modify(renamedFile, `${current}\nline 2`);
+			return `Renamed ${untitledPath} -> ${renamedPath} and appended a post-rename edit`;
+		});
+
+		await runStep("Folder rename cascade with post-rename edit", async () => {
+			const sourceFolder = normalizePath(`${rootDir}/rename-source`);
+			const destinationFolder = normalizePath(`${rootDir}/rename-destination`);
+			const targetPath = normalizePath(`${sourceFolder}/nested/target.md`);
+			await this.app.vault.create(targetPath, "# Rename target\n\nbefore rename");
+
+			const sourceNode = this.app.vault.getAbstractFileByPath(sourceFolder);
+			if (!sourceNode) {
+				throw new Error(`Folder missing: ${sourceFolder}`);
+			}
+			await this.app.fileManager.renameFile(sourceNode, destinationFolder);
+
+			const movedTargetPath = normalizePath(`${destinationFolder}/nested/target.md`);
+			const movedTarget = this.app.vault.getAbstractFileByPath(movedTargetPath);
+			if (!(movedTarget instanceof TFile)) {
+				throw new Error(`Renamed target missing: ${movedTargetPath}`);
+			}
+			const current = await this.app.vault.read(movedTarget);
+			await this.app.vault.modify(movedTarget, `${current}\npost-rename line`);
+			return `Renamed folder ${sourceFolder} -> ${destinationFolder}`;
+		});
+
+		await runStep("Delete and recreate same path", async () => {
+			const tombstonePath = normalizePath(`${rootDir}/tombstone.md`);
+			const file = await this.app.vault.create(
+				tombstonePath,
+				"# Tombstone test\n\noriginal content",
+			);
+			await this.app.vault.delete(file, true);
+			await this.app.vault.create(
+				tombstonePath,
+				"# Tombstone test\n\nrecreated content",
+			);
+			return `Deleted and recreated ${tombstonePath}`;
+		});
+
+		await runStep("Create 3 MB binary attachment", async () => {
+			const blobPath = normalizePath(`${rootDir}/attachment-3mb.bin`);
+			const bytes = new Uint8Array(3 * 1024 * 1024);
+			for (let i = 0; i < bytes.length; i++) {
+				bytes[i] = i % 251;
+			}
+			await this.app.vault.createBinary(blobPath, bytes.buffer);
+			if (!this.settings.enableAttachmentSync) {
+				return `Created ${blobPath} (${bytes.length} bytes). Attachment sync is disabled in settings.`;
+			}
+			return `Created ${blobPath} (${bytes.length} bytes) for attachment sync path`;
+		});
+
+		const failures = steps.filter((step) => step.status === "error");
+		const report = {
+			generatedAt: new Date().toISOString(),
+			durationMs: Date.now() - startedAt,
+			runId,
+			rootDir,
+			trace: this.getTraceHttpContext() ?? null,
+			settings: {
+				host: this.settings.host,
+				vaultId: this.settings.vaultId,
+				deviceName: this.settings.deviceName,
+				enableAttachmentSync: this.settings.enableAttachmentSync,
+				externalEditPolicy: this.settings.externalEditPolicy,
+				debug: this.settings.debug,
+			},
+			syncState: {
+				connected: this.vaultSync.connected,
+				providerSynced: this.vaultSync.providerSynced,
+				localReady: this.vaultSync.localReady,
+				connectionGeneration: this.vaultSync.connectionGeneration,
+				reconciled: this.reconciled,
+				openFileCount: this.openFilePaths.size,
+				pathToIdCount: this.vaultSync.pathToId.size,
+				activePathCount: this.vaultSync.getActiveMarkdownPaths().length,
+				pathToBlobCount: this.vaultSync.pathToBlob.size,
+				pendingUploads: this.blobSync?.pendingUploads ?? 0,
+				pendingDownloads: this.blobSync?.pendingDownloads ?? 0,
+			},
+			steps,
+			recentEvents: {
+				plugin: this.eventRing.slice(-120),
+				sync: this.vaultSync.getRecentEvents(120),
+			},
+		};
+
+		const diagDir = await this.ensureDiagnosticsDir();
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const outPath = normalizePath(
+			`${diagDir}/vfs-torture-${stamp}-${this.settings.deviceName || "device"}.json`,
+		);
+		await this.app.vault.adapter.write(outPath, JSON.stringify(report, null, 2));
+
+		if (failures.length > 0) {
+			new Notice(
+				`YAOS VFS torture run finished with ${failures.length} failed step(s). Report: ${outPath}`,
+				12000,
+			);
+			this.log(
+				`VFS torture: completed with ${failures.length} failures. Report=${outPath}`,
+			);
+			return;
+		}
+
+		new Notice(`YAOS VFS torture run completed. Report: ${outPath}`, 10000);
+		this.log(`VFS torture: completed successfully. Report=${outPath}`);
 	}
 
 	// -------------------------------------------------------------------
@@ -2644,6 +3274,45 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (this.settings.debug) {
 			console.log(`[yaos] ${msg}`);
 		}
+	}
+
+	private isIndexedDbRelatedError(err: unknown): boolean {
+		if (!err) return false;
+		const name =
+			typeof (err as { name?: unknown })?.name === "string"
+				? (err as { name: string }).name
+				: "";
+		const message =
+			typeof (err as { message?: unknown })?.message === "string"
+				? (err as { message: string }).message
+				: String(err);
+		const haystack = `${name} ${message}`.toLowerCase();
+		return haystack.includes("quotaexceeded")
+			|| haystack.includes("quota exceeded")
+			|| haystack.includes("indexeddb")
+			|| haystack.includes("idb");
+	}
+
+	private handleIndexedDbDegraded(source: string, err?: unknown): void {
+		if (!this.vaultSync) return;
+		if (err) {
+			this.vaultSync.reportIndexedDbError(err, "runtime");
+		}
+		if (!this.vaultSync.idbError || this.idbDegradedHandled) return;
+
+		this.idbDegradedHandled = true;
+		const kind = this.vaultSync.idbErrorDetails?.kind ?? "unknown";
+		this.log(`IndexedDB degraded (${source}): kind=${kind}`);
+		this.scheduleTraceStateSnapshot("idb-degraded");
+
+		if (this.blobSync) {
+			void this.stopBlobSyncEngine("idb-degraded");
+		}
+
+		const notice = kind === "quota_exceeded"
+			? "YAOS: Device storage is full. Sync durability is degraded and attachment transfers are paused. Free up storage, then restart Obsidian."
+			: "YAOS: IndexedDB persistence failed. Sync durability is degraded and attachment transfers are paused.";
+		new Notice(notice, 12000);
 	}
 }
 
