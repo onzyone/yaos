@@ -3004,7 +3004,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const node = this.app.vault.getAbstractFileByPath(path);
 			if (!(node instanceof TFile)) continue;
 			try {
-				await this.app.vault.delete(node, true);
+				await this.app.fileManager.trashFile(node);
 				removed++;
 			} catch (err) {
 				this.log(`schema migration: failed to remove loser path "${path}": ${String(err)}`);
@@ -3149,7 +3149,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				tombstonePath,
 				"# Tombstone test\n\noriginal content",
 			);
-			await this.app.vault.delete(file, true);
+			await this.app.fileManager.trashFile(file);
 			await this.app.vault.create(
 				tombstonePath,
 				"# Tombstone test\n\nrecreated content",
