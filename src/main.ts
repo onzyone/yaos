@@ -23,6 +23,19 @@ import {
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { applyDiffToYText } from "./sync/diff";
 import {
+	isFrontmatterBlocked,
+	validateFrontmatterTransition,
+	extractFrontmatter,
+	type FrontmatterValidationResult,
+} from "./sync/frontmatterGuard";
+import {
+	buildFrontmatterQuarantineDebugLines,
+	clearFrontmatterQuarantinePath,
+	readPersistedFrontmatterQuarantine,
+	upsertFrontmatterQuarantineEntry,
+	type FrontmatterQuarantineEntry,
+} from "./sync/frontmatterQuarantine";
+import {
 	type DiskIndex,
 	collectFileStats,
 	filterChangedFiles,
@@ -72,6 +85,7 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_blobQueue?: BlobQueueSnapshot;
 	_serverCapabilitiesCache?: PersistedServerCapabilitiesCache;
 	_updateManifestCache?: PersistedUpdateManifestCache;
+	_frontmatterQuarantine?: FrontmatterQuarantineEntry[];
 };
 
 /** Minimum interval between reconcile runs (prevents rapid reconnect churn). */
@@ -82,6 +96,7 @@ const FAST_RECONNECT_MIN_INTERVAL_MS = 2_000;
 const MARKDOWN_DIRTY_SETTLE_MS = 350;
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
 const BOUND_RECOVERY_LOCK_MS = 1500;
+const FRONTMATTER_GUARD_NOTICE_MS = 30_000;
 const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
 const UPDATE_MANIFEST_URLS = [
 	"https://github.com/kavinsood/yaos/releases/latest/download/update-manifest.json",
@@ -279,6 +294,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private legacyServerNoticeShown = false;
 	private commandsRegistered = false;
 	private idbDegradedHandled = false;
+	private frontmatterGuardNoticeAt = new Map<string, number>();
+	private frontmatterQuarantineEntries: FrontmatterQuarantineEntry[] = [];
 
 	/**
 	 * True when startup timed out waiting for provider sync.
@@ -441,6 +458,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.editorBindings,
 				this.settings.debug,
 				(source, msg, details) => this.trace(source, msg, details),
+				() => this.settings.frontmatterGuardEnabled,
+				(path, direction, reason, validation, previousContent, nextContent) =>
+					this.handleFrontmatterValidation(
+						path,
+						direction,
+						reason,
+						validation,
+						previousContent,
+						nextContent,
+					),
 			);
 			this.diskMirror.startMapObservers();
 
@@ -1880,6 +1907,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			if (existingText) {
 				const crdtContent = existingText.toJSON();
 				if (crdtContent === content) return;
+				if (this.shouldBlockFrontmatterIngest(
+					file.path,
+					crdtContent,
+					content,
+					"disk-to-crdt",
+				)) {
+					await this.updateDiskIndexForPath(file.path);
+					return;
+				}
 
 				// Apply a line-level diff to the Y.Text instead of delete-all + insert-all.
 				// This preserves CRDT history, cursor positions, and awareness state.
@@ -1890,6 +1926,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				);
 				applyDiffToYText(existingText, crdtContent, content, "disk-sync");
 			} else {
+				if (this.shouldBlockFrontmatterIngest(
+					file.path,
+					null,
+					content,
+					"disk-to-crdt-seed",
+				)) {
+					await this.updateDiskIndexForPath(file.path);
+					return;
+				}
 				this.vaultSync.ensureFile(
 					file.path,
 					content,
@@ -1989,12 +2034,39 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			});
 
 			if (existingText) {
+				if (this.shouldBlockFrontmatterIngest(
+					file.path,
+					crdtContent ?? "",
+					content,
+					"bound-file-local-only-divergence",
+				)) {
+					this.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+					return true;
+				}
 				this.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound local-only divergence: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
 				);
+				this.trace("trace", "bound-file-recovery-source-selected", {
+					path: file.path,
+					reason: "bound-file-local-only-divergence",
+					chosenSource: "disk",
+					action: "applied-repair-only",
+					editorLengths: localOnlyViews.map((state) => state.editorContent.length),
+					diskLength: content.length,
+					crdtLength: crdtContent?.length ?? null,
+				});
 				applyDiffToYText(existingText, crdtContent ?? "", content, "disk-sync-recover-bound");
 			} else {
+				if (this.shouldBlockFrontmatterIngest(
+					file.path,
+					null,
+					content,
+					"bound-file-local-only-seed",
+				)) {
+					this.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+					return true;
+				}
 				this.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound, missing CRDT text: seeding ${content.length} chars)`,
@@ -2004,23 +2076,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					content,
 					this.settings.deviceName,
 				);
-				}
+			}
 			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
 
-				for (const state of localOnlyViews) {
-					const repaired = this.editorBindings?.heal(
+			for (const state of localOnlyViews) {
+				const repaired = this.editorBindings?.repair(
+					state.view,
+					this.settings.deviceName,
+					"bound-file-local-only-divergence",
+				) ?? false;
+				if (!repaired) {
+					this.editorBindings?.rebind(
 						state.view,
 						this.settings.deviceName,
 						"bound-file-local-only-divergence",
-					) ?? false;
-					if (!repaired) {
-						this.editorBindings?.rebind(
-							state.view,
-							this.settings.deviceName,
-							"bound-file-local-only-divergence",
-						);
-					}
+					);
 				}
+			}
 
 			this.scheduleTraceStateSnapshot("bound-file-desync-recovery");
 			return true;
@@ -2041,12 +2113,30 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// Active editor is open but idle; treat disk as an external edit
 			// and ingest it into CRDT instead of deferring forever.
 			if (existingText) {
+				if (this.shouldBlockFrontmatterIngest(
+					file.path,
+					crdtContent ?? "",
+					content,
+					"bound-file-open-idle-disk-recovery",
+				)) {
+					this.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+					return true;
+				}
 				this.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound external disk edit while idle: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
 				);
 				applyDiffToYText(existingText, crdtContent ?? "", content, "disk-sync-open-idle-recover");
 			} else {
+				if (this.shouldBlockFrontmatterIngest(
+					file.path,
+					null,
+					content,
+					"bound-file-open-idle-seed",
+				)) {
+					this.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+					return true;
+				}
 				this.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound idle disk edit, missing CRDT text: seeding ${content.length} chars)`,
@@ -2084,6 +2174,134 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, ambiguous divergence)`);
 		this.scheduleTraceStateSnapshot("bound-file-ambiguous");
 		return true;
+	}
+
+	private shouldBlockFrontmatterIngest(
+		path: string,
+		previousContent: string | null,
+		nextContent: string,
+		reason: string,
+	): boolean {
+		if (!this.settings.frontmatterGuardEnabled) return false;
+
+		const validation = validateFrontmatterTransition(previousContent, nextContent);
+		this.handleFrontmatterValidation(
+			path,
+			"disk-to-crdt",
+			reason,
+			validation,
+			previousContent,
+			nextContent,
+		);
+		if (!isFrontmatterBlocked(validation)) return false;
+		this.log(
+			`Frontmatter ingest blocked for "${path}" ` +
+			`(${validation.reasons.join(", ") || validation.risk})`,
+		);
+		return true;
+	}
+
+	private handleFrontmatterValidation(
+		path: string,
+		direction: "disk-to-crdt" | "crdt-to-disk",
+		reason: string,
+		validation: FrontmatterValidationResult,
+		previousContent: string | null,
+		nextContent: string,
+	): void {
+		if (validation.risk === "ok") {
+			void this.clearFrontmatterQuarantine(path, `${direction}:${reason}`);
+			return;
+		}
+
+		if (!isFrontmatterBlocked(validation)) return;
+
+		this.traceFrontmatterQuarantine(
+			path,
+			direction,
+			reason,
+			validation,
+			previousContent?.length ?? null,
+			nextContent.length,
+		);
+		this.showFrontmatterGuardNotice(path, direction);
+		void this.persistFrontmatterQuarantine(path, direction, validation, previousContent, nextContent);
+	}
+
+	private showFrontmatterGuardNotice(
+		path: string,
+		direction: "disk-to-crdt" | "crdt-to-disk",
+	): void {
+		const key = `${direction}:${path}`;
+		const now = Date.now();
+		if ((this.frontmatterGuardNoticeAt.get(key) ?? 0) + FRONTMATTER_GUARD_NOTICE_MS > now) {
+			return;
+		}
+
+		this.frontmatterGuardNoticeAt.set(key, now);
+		new Notice(
+			`YAOS paused a properties update in "${path}" because the frontmatter looked unsafe. Check diagnostics before accepting the change.`,
+			12_000,
+		);
+	}
+
+	private traceFrontmatterQuarantine(
+		path: string,
+		direction: "disk-to-crdt" | "crdt-to-disk",
+		reason: string,
+		validation: FrontmatterValidationResult,
+		previousLength: number | null,
+		nextLength: number,
+	): void {
+		this.trace("trace", "frontmatter-quarantined", {
+			path,
+			direction,
+			reason,
+			risk: validation.risk,
+			reasons: validation.reasons,
+			previousLength,
+			nextLength,
+			previousFrontmatterLength: validation.previousFrontmatterLength ?? null,
+			nextFrontmatterLength: validation.frontmatterLength,
+		});
+	}
+
+	private async persistFrontmatterQuarantine(
+		path: string,
+		direction: "disk-to-crdt" | "crdt-to-disk",
+		validation: FrontmatterValidationResult,
+		previousContent: string | null,
+		nextContent: string,
+	): Promise<void> {
+		const now = Date.now();
+		const prevHash = await this.hashFrontmatterContent(previousContent);
+		const nextHash = await this.hashFrontmatterContent(nextContent);
+		this.frontmatterQuarantineEntries = upsertFrontmatterQuarantineEntry(
+			this.frontmatterQuarantineEntries,
+			{
+				path,
+				firstSeenAt: now,
+				lastSeenAt: now,
+				direction,
+				reasons: validation.reasons,
+				prevHash,
+				nextHash,
+				count: 1,
+			},
+		);
+		await this.persistPluginState();
+	}
+
+	private async clearFrontmatterQuarantine(path: string, reason: string): Promise<void> {
+		if (this.frontmatterQuarantineEntries.length === 0) return;
+		const nextEntries = clearFrontmatterQuarantinePath(this.frontmatterQuarantineEntries, path);
+		if (nextEntries.length === this.frontmatterQuarantineEntries.length) return;
+		this.frontmatterQuarantineEntries = nextEntries;
+		this.trace("trace", "frontmatter-quarantine-cleared", {
+			path,
+			reason,
+		});
+		await this.persistPluginState();
 	}
 
 	private async updateDiskIndexForPath(path: string): Promise<void> {
@@ -2530,6 +2748,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.updateManifest = null;
 			this.updateManifestFetchedAt = 0;
 		}
+		this.frontmatterQuarantineEntries = readPersistedFrontmatterQuarantine(data?._frontmatterQuarantine);
 		this.refreshPersistedState();
 		if (migratedSettings) {
 			await this.persistPluginState();
@@ -3378,6 +3597,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		} else {
 			delete nextState._updateManifestCache;
 		}
+		if (this.frontmatterQuarantineEntries.length > 0) {
+			nextState._frontmatterQuarantine = this.frontmatterQuarantineEntries;
+		} else {
+			delete nextState._frontmatterQuarantine;
+		}
 		this.persistedState = nextState;
 	}
 
@@ -3435,6 +3659,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`Open files: ${this.openFilePaths.size}`,
 			`Server trace events: ${this.recentServerTrace.length}`,
 			`Remote cursors: ${this.settings.showRemoteCursors ? "shown" : "hidden"}`,
+			...buildFrontmatterQuarantineDebugLines(this.frontmatterQuarantineEntries),
 		].join("\n");
 	}
 
@@ -3456,6 +3681,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const data = new TextEncoder().encode(text);
 		const digest = await crypto.subtle.digest("SHA-256", data);
 		return arrayBufferToHex(digest);
+	}
+
+	private async hashFrontmatterContent(content: string | null): Promise<string | undefined> {
+		if (content == null) return undefined;
+		const block = extractFrontmatter(content);
+		if (block.kind !== "present") return undefined;
+		return await this.sha256Hex(block.frontmatterText);
 	}
 
 	private async exportDiagnostics(): Promise<void> {
